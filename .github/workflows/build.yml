@@ -68,15 +68,17 @@ jobs:
         run: |
           mkdir out
 
-      - name: Build xiaomi-curtana
+      - name: Build xiaomi-miatoll
         run: |
           cp xiaomi-miatoll.cfg ~/.config/pmbootstrap_v3.cfg
           pmbootstrap build adbd-linux
           pmbootstrap config extra_packages adbd-linux
+          # Add debug-shell hook to initramfs
+          pmbootstrap initfs hook_add debug-shell
           pmbootstrap install --password 147147 --split
           pmbootstrap export
           ls /tmp/postmarketOS-export/ -la
-          cp /tmp/postmarketOS-export/boot.img out/boot-xiaomi-tianma-miatoll.img
+          cp /tmp/postmarketOS-export/boot.img out/boot-xiaomi-miatoll.img
 
           # for case without "--split", the resulting file is xiaomi.img
           cp /tmp/postmarketOS-export/*miatoll*.img out/ || true
@@ -84,6 +86,7 @@ jobs:
           # for case with split, the result file is xiaomi-root.img
           cp /tmp/postmarketOS-export/*miatoll-*.img out/ || true
           
+          # Optionally switch to huaxing panel (uncomment if needed)
           #sed -i 's/tianma/huaxing/g' ~/.config/pmbootstrap_v3.cfg
           #pmbootstrap export
           #cp /tmp/postmarketOS-export/boot.img out/boot-xiaomi-huaxing-miatoll.img
@@ -93,6 +96,6 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xiaomi-curtana-${{ env.KERNEL_BRANCH }}
-          path: out/*-miatol*.img*
+          name: xiaomi-miatoll-${{ env.KERNEL_BRANCH }}
+          path: out/*.img*
           retention-days: 7
