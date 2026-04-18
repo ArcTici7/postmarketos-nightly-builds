@@ -1,101 +1,82 @@
-name: Build images
+name: Build Minimal Boot Image with Serial Console
+
 on:
-  push:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * 5' # Run every friday at midnight
 
 env:
-  KERNEL_BRANCH: 6.12.1
+  ARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
 
 jobs:
-  build-image:
-    strategy:
-      matrix:
-        version: ["default"]
-
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out build configurations
-        uses: actions/checkout@v4
-
-      - name: Substitute placeholders in configs
+      - name: Install dependencies
         run: |
-          find . -type f -name "*.cfg" -exec sed -i "s|HOME|$(echo $HOME)|;s|NPROC|$(nproc)|" {} +
+          sudo apt update
+          sudo apt install -y wget cpio gzip abootimg device-tree-compiler
 
-      - name: Install pmbootstrap from git
+      - name: Download prebuilt kernel from 99degree/linux
         run: |
-          git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git
-          mkdir -p ~/.local/bin
-          ln -s "$PWD/pmbootstrap/pmbootstrap.py" ~/.local/bin/pmbootstrap
-          pmbootstrap --version
+          # Find the latest successful artifact from 99degree/linux Actions
+          # For simplicity, we'll clone the kernel source and build it directly (faster than hunting artifact)
+          git clone --depth 1 --branch lineage-22.2 https://github.com/ArcTici7/linux-miatoll.git kernel
+          cd kernel
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- sm7125.config
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
+          cp arch/arm64/boot/Image ../Image
+          # Try to find a DTB – use generic if Huaxing fails
+          if [ -f arch/arm64/boot/dts/qcom/sm7125-xiaomi-joyeuse.dtb ]; then
+            cp arch/arm64/boot/dts/qcom/sm7125-xiaomi-joyeuse.dtb ../dtb
+          else
+            # Fallback to any miatoll dtb
+            cp $(find arch/arm64/boot/dts/qcom -name "*.dtb" | head -1) ../dtb
+          fi
+          cd ..
+          # Append DTB to kernel (if we have one)
+          if [ -f dtb ]; then
+            cat Image dtb > Image-dtb
+          else
+            cp Image Image-dtb
+          fi
 
-      - name: Set up pmaports
+      - name: Create minimal initramfs with serial console
         run: |
-          echo -e '\n\nedge\nfairphone\nfp4\n\n\nphosh\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n' | pmbootstrap init || true
-          cd ~/.local/var/pmbootstrap/cache_git/pmaports
-          git remote add 99degree https://github.com/99degree/pmaports.git
-          DEFAULT_BRANCH=$(git remote show sm7125 | awk '/HEAD branch/ {print $NF}')
-          git fetch 99degree $DEFAULT_BRANCH
-          #git reset --hard 99degree/$DEFAULT_BRANCH
-          git checkout 99degree/next -- main/adbd-linux
+          mkdir -p initramfs/{dev,proc,sys,bin}
+          cat > initramfs/init << 'EOF'
+          #!/bin/sh
+          mount -t proc proc /proc
+          mount -t sysfs sysfs /sys
+          mount -t devtmpfs devtmpfs /dev
+          # Load USB serial gadget module (if built as module; if built-in, ignore)
+          modprobe g_serial 2>/dev/null
+          echo "Starting shell on USB serial (ttyGS0)" > /dev/ttyGS0
+          exec /bin/sh < /dev/ttyGS0 > /dev/ttyGS0 2>&1
+          EOF
+          chmod +x initramfs/init
+          # Download static busybox
+          wget -q https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox -O initramfs/bin/busybox
+          chmod +x initramfs/bin/busybox
+          cd initramfs
+          ln -s bin/busybox bin/sh
+          ln -s bin/busybox bin/cat
+          ln -s bin/busybox bin/mount
+          find . | cpio -o -H newc | gzip > ../initrd.gz
+          cd ..
 
-      - name: Check kernel branch
-        if: matrix.version == 'default'
+      - name: Pack boot.img
         run: |
-          DEFAULT_BRANCH=$(curl -s  https://api.github.com/repos/sm7125-mainline/linux | jq -r '.default_branch')
-          echo "Default branch is $DEFAULT_BRANCH"
-          echo "KERNEL_BRANCH=$DEFAULT_BRANCH" >> $GITHUB_ENV
+          cat > bootimg.cfg << EOF
+          pagesize = 0x1000
+          kerneladdr = 0x00008000
+          ramdiskaddr = 0x01000000
+          tagsaddr = 0x00000100
+          cmdline = console=tty0 console=ttyGS0,115200
+          EOF
+          abootimg --create boot.img -f bootimg.cfg -k Image-dtb -r initrd.gz
 
-      - name: Clone kernel sources
-        run: |
-          #git clone https://github.com/sm7125-mainline/linux.git --single-branch --branch ${{ env.KERNEL_BRANCH }} --depth 1 ./linux
-
-      - name: Choose any SM7125 device in pmbootstrap to build kernel
-        run: |
-          cp xiaomi-miatoll.cfg ~/.config/pmbootstrap_v3.cfg
-
-      - name: Compile kernel with envkernel
-        run: |
-          #cd linux
-          #shopt -s expand_aliases
-          #source ../pmbootstrap/helpers/envkernel.sh
-          #make defconfig sm7125.config
-          #make -j$(nproc)
-          #pmbootstrap build --envkernel linux-postmarketos-qcom-sm7125
-
-      - name: Create artifact directory
-        run: |
-          mkdir out
-
-      - name: Build xiaomi-miatoll
-        run: |
-          cp xiaomi-miatoll.cfg ~/.config/pmbootstrap_v3.cfg
-          pmbootstrap build adbd-linux
-          pmbootstrap config extra_packages adbd-linux
-          # Add debug-shell hook to initramfs
-          pmbootstrap initfs hook_add debug-shell
-          pmbootstrap install --password 147147 --split
-          pmbootstrap export
-          ls /tmp/postmarketOS-export/ -la
-          cp /tmp/postmarketOS-export/boot.img out/boot-xiaomi-miatoll.img
-
-          # for case without "--split", the resulting file is xiaomi.img
-          cp /tmp/postmarketOS-export/*miatoll*.img out/ || true
-
-          # for case with split, the result file is xiaomi-root.img
-          cp /tmp/postmarketOS-export/*miatoll-*.img out/ || true
-          
-          # Optionally switch to huaxing panel (uncomment if needed)
-          #sed -i 's/tianma/huaxing/g' ~/.config/pmbootstrap_v3.cfg
-          #pmbootstrap export
-          #cp /tmp/postmarketOS-export/boot.img out/boot-xiaomi-huaxing-miatoll.img
-          #xz -T0 -9e -v out/xiaomi-miatoll*.img
-          echo -e "n\nn\ny\n" | pmbootstrap zap
-
-      - name: Upload artifacts
+      - name: Upload boot.img
         uses: actions/upload-artifact@v4
         with:
-          name: xiaomi-miatoll-${{ env.KERNEL_BRANCH }}
-          path: out/*.img*
-          retention-days: 7
+          name: minimal-boot
+          path: boot.img
